@@ -493,6 +493,87 @@ def evaluate_split_accuracy(
         correct += sum(scores)
     return correct / total
 
+# ======================================
+# Section 7.1 — full-set evaluation utils
+# ======================================
+
+def run_full_eval(
+    system_prompt: str,
+    examples: List[TrainExample],
+    task_model: SimpleHFChat,
+    batch_size: int = 16,
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    Returns:
+      acc: accuracy on the split
+      details: per-example dicts {gold, parsed, ok, output}
+    """
+    total = len(examples)
+    if total == 0:
+        return 0.0, []
+
+    correct = 0.0
+    details: List[Dict[str, Any]] = []
+
+    for start in range(0, total, batch_size):
+        ex_batch = examples[start:start + batch_size]
+        _, scores, traj = evaluate_minibatch_once(
+            current_system_prompt=system_prompt,
+            minibatch_examples=ex_batch,
+            task_model=task_model,
+            generation_temperature=0.4,
+            generation_top_p=0.95,
+            generation_max_new_tokens=192
+        )
+        correct += sum(scores)
+        for t in traj:
+            details.append({
+                "gold": t["gold_label"],
+                "parsed": t.get("parsed_label"),
+                "ok": int(t.get("parsed_label") == t["gold_label"]),
+                "output": t["model_output_full_text"],
+            })
+    return correct / total, details
+
+
+def evaluate_prompt_on_splits(
+    system_prompt: str,
+    splits: Dict[str, List[TrainExample]],
+    task_model: SimpleHFChat,
+    eval_splits: List[str],
+    batch_size: int = 16,
+    dump_preds: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Evaluate `system_prompt` on chosen splits (e.g., ["dev","test"]).
+    If dump_preds is provided, saves a JSONL with one record per example:
+      {"split": "...", "gold": "...", "parsed": "...", "ok": 0|1, "output": "..."}
+    """
+    metrics: Dict[str, float] = {}
+    f_out = None
+    try:
+        if dump_preds:
+            f_out = open(dump_preds, "w", encoding="utf-8")
+
+        for name in eval_splits:
+            if name not in splits:
+                print(f"[WARN] Unknown split '{name}' (available: {list(splits.keys())})")
+                continue
+            acc, details = run_full_eval(system_prompt, splits[name], task_model, batch_size=batch_size)
+            metrics[name] = acc
+            print(f"[EVAL] {name.upper()} n={len(splits[name])} acc={acc:.3f}")
+
+            if f_out:
+                for d in details:
+                    rec = {"split": name, **d}
+                    f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    finally:
+        if f_out:
+            f_out.close()
+            print(f"[EVAL] wrote predictions to {dump_preds}")
+    return metrics
+
+
 
 # ======================================
 # Section 8 — acceptance loop (the heart)
@@ -599,14 +680,26 @@ DEFAULT_SEED_PROMPT = (
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["optimize", "evaluate"], default="optimize",
+                        help="optimize: run reflective search; evaluate: score a given prompt.")
     parser.add_argument("--json_path", type=str, required=True, help="Path to data/trainset.json")
-    parser.add_argument("--target_label", type=str, default="Providing_Guidance", choices=["Providing_Guidance", "Mistake_Identification"])
+    parser.add_argument("--target_label", type=str, default="Providing_Guidance",
+                        choices=["Providing_Guidance", "Mistake_Identification"])
     parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--openai_reflector_model", type=str, default="gpt-4o-mini")
+
+    # optimize-mode knobs
     parser.add_argument("--iterations", type=int, default=60)
     parser.add_argument("--minibatch_size", type=int, default=12)
     parser.add_argument("--dev_every", type=int, default=5)
     parser.add_argument("--patience", type=int, default=20)
+
+    # evaluate-mode knobs
+    parser.add_argument("--prompt_text", type=str, default=None, help="Inline prompt text to evaluate.")
+    parser.add_argument("--prompt_path", type=str, default=None, help="Path to a text file with the prompt.")
+    parser.add_argument("--eval_splits", type=str, default="dev,test", help="Comma list among train,dev,test.")
+    parser.add_argument("--dump_preds", type=str, default=None, help="Path to write JSONL predictions.")
+
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
 
@@ -623,8 +716,35 @@ def main():
     print(f"Loading HF task model: {args.hf_task_model}")
     task_model = SimpleHFChat(args.hf_task_model)
 
+    if args.mode == "evaluate":
+        # decide prompt
+        prompt = None
+        if args.prompt_text:
+            prompt = args.prompt_text
+        elif args.prompt_path and os.path.exists(args.prompt_path):
+            prompt = open(args.prompt_path, "r", encoding="utf-8").read()
+        else:
+            prompt = DEFAULT_SEED_PROMPT
+            print("[EVAL] No --prompt_text/--prompt_path provided; using DEFAULT_SEED_PROMPT.")
+
+        # which splits to eval
+        wanted = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
+        splits = {"train": train, "dev": dev, "test": test}
+
+        # run evaluation
+        evaluate_prompt_on_splits(
+            system_prompt=prompt,
+            splits=splits,
+            task_model=task_model,
+            eval_splits=wanted,
+            batch_size=max(8, args.minibatch_size),
+            dump_preds=args.dump_preds
+        )
+        return
+
+    # === optimize mode (default) ===
     # reflector (OpenAI)
-    if "OPENAI_API_KEY" not in os.environ or not os.environ["OPENAI_API_KEY"]:
+    if not os.environ.get("OPENAI_API_KEY"):
         print("WARNING: OPENAI_API_KEY not set; reflection will fail. Set env var to enable reflector.", file=sys.stderr)
     reflector = OpenAIReflector(model_name=args.openai_reflector_model)
 
