@@ -208,6 +208,133 @@ class SimpleHFChat:
                 results.append(full.strip())
         return results
 
+class QwenHFChat:
+    """
+    Qwen-flavored chat wrapper that:
+      - builds proper chat messages (system + user)
+      - uses apply_chat_template(..., enable_thinking=True)
+      - splits the generated text at the last </think> token (if present)
+    Returns both full text (thinking + content) and assistant-only content.
+    """
+    def __init__(self, model_name_or_path: str, device: Optional[str] = None, dtype: str = "auto"):
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+
+        self.model_name = model_name_or_path
+        print("Model name loaded")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+            padding_side="left"  # important for decoder-only
+        )
+        print("Tokenizer loaded")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            #device_map=torch.device("cuda"),
+            torch_dtype=torch.bfloat16, #dtype if dtype != "auto" else None,
+            #trust_remote_code=True
+        )
+        self.model.to(torch.device("cuda"))
+        self.model.eval()
+        print("Model loaded internally")
+
+        # Resolve the special token id for </think> once, safely.
+        # Do NOT hardcode magic ids like 151668.
+        try:
+            self.end_think_id = self.tokenizer.convert_tokens_to_ids("</think>")
+            if not isinstance(self.end_think_id, int) or self.end_think_id <= 0:
+                self.end_think_id = None
+        except Exception:
+            self.end_think_id = None
+
+    def _render_batch_prompts(self, system_prompt: str, user_texts: List[str]) -> List[str]:
+        rendered: List[str] = []
+        for user_text in user_texts:
+            messages = [
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_text.strip()},
+            ]
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True  # let Qwen open a <think> ... </think> block
+            )
+            rendered.append(text)
+        return rendered
+
+    def generate_full_and_assistant(
+        self,
+        system_prompt: str,
+        user_texts: List[str],
+        temperature: float = 0.2,
+        top_p: float = 0.95,
+        max_new_tokens: int = 256,
+        repetition_penalty: float = 1.05,
+    ) -> List[tuple[str, str]]:
+        """
+        Returns a list of (full_text, assistant_text) for each input:
+          - full_text: decoded "thinking + content" (nice for logs)
+          - assistant_text: only the post-</think> segment (parse this!)
+        """
+        import torch
+        from transformers import GenerationConfig
+
+        prompts = self._render_batch_prompts(system_prompt, user_texts)
+        #print("Prompts rendered")
+        #print(prompts)
+        #print("\n\n\n\n\n\n")
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
+
+        gen_cfg = GenerationConfig(
+            do_sample=(temperature > 0.0),
+            temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+
+        with torch.inference_mode():
+            outputs = self.model.generate(**inputs, generation_config=gen_cfg)
+
+        results: List[tuple[str, str]] = []
+        input_lens = [int(row.shape[0]) for row in inputs.input_ids]  # per-example prompt length
+
+        for i in range(outputs.shape[0]):
+            full_ids = outputs[i].tolist()
+            tail_ids = full_ids[input_lens[i]:]  # only the generated continuation
+
+            # Split tail at the last </think>, if that token id exists
+            assistant_start = 0
+            if self.end_think_id is not None:
+                try:
+                    # reverse search for the last occurrence
+                    rev_index = tail_ids[::-1].index(self.end_think_id)
+                    last_pos = len(tail_ids) - 1 - rev_index
+                    assistant_start = last_pos + 1
+                except ValueError:
+                    assistant_start = 0  # no </think> found in the tail
+
+            think_ids = tail_ids[:assistant_start]
+            content_ids = tail_ids[assistant_start:]
+            #print("Think ids: ", think_ids)
+            #print("Content ids: ", content_ids)
+            thinking_content = self.tokenizer.decode(think_ids, skip_special_tokens=True).strip()
+            assistant_content = self.tokenizer.decode(content_ids, skip_special_tokens=True).strip()
+            print(assistant_content)
+            if thinking_content and assistant_content:
+                full_text = (thinking_content + "\n" + assistant_content).strip()
+            else:
+                # if we couldn't split, the "assistant_content" is the whole decode
+                full_text = (thinking_content or assistant_content).strip()
+
+            results.append((full_text, assistant_content))
+        #print(results)
+
+        return results
+
+
 
 # ======================================
 # Section 3 — parsing + minibatch scoring
@@ -239,7 +366,7 @@ def parse_answer_tag(text: str) -> Optional[str]:
         if lbl.lower() in candidate:
             return lbl
     return None
-
+'''
 def evaluate_minibatch_once(
     current_system_prompt: str,
     minibatch_examples: List[TrainExample],
@@ -279,7 +406,69 @@ def evaluate_minibatch_once(
             "model_output_full_text": out,
             "parsed_label": parsed
         })
+    return raw_outputs, scores, trajectories'''
+
+def evaluate_minibatch_once(
+    current_system_prompt: str,
+    minibatch_examples: List[TrainExample],
+    task_model: Any, 
+    generation_temperature: float = 0.2,
+    generation_top_p: float = 0.95,
+    generation_max_new_tokens: int = 2048,
+) -> Tuple[List[str], List[float], List[Dict[str, Any]]]:
+    """
+    Returns:
+      raw_outputs: list of FULL model texts (thinking + content) for logging
+      scores: list of 0/1 accuracies
+      trajectories: list of dicts with input_text, gold_label, model_output_full_text, assistant_text, parsed_label
+    """
+    user_inputs = [ex.input_text for ex in minibatch_examples]
+
+    # Prefer Qwen path that returns (full_text, assistant_text)
+    has_qwen_api = hasattr(task_model, "generate_full_and_assistant")
+
+    try:
+        if has_qwen_api:
+            pairs = task_model.generate_full_and_assistant(
+                system_prompt=current_system_prompt,
+                user_texts=user_inputs,
+                temperature=generation_temperature,
+                top_p=generation_top_p,
+                max_new_tokens=generation_max_new_tokens,
+            )
+            raw_outputs = [ft for (ft, _) in pairs]
+            assistant_texts = [at for (_, at) in pairs]
+        else:
+            # Fallback: old wrapper returns a single string; parse that directly.
+            raw_outputs = task_model.generate(
+                system_prompt=current_system_prompt,
+                user_texts=user_inputs,
+                temperature=generation_temperature,
+                top_p=generation_top_new_tokens,
+                max_new_tokens=generation_max_new_tokens,
+            )
+            assistant_texts = list(raw_outputs)  # no split available
+    except Exception:
+        # Robust to transient generation failures
+        raw_outputs = [""] * len(user_inputs)
+        assistant_texts = [""] * len(user_inputs)
+
+    scores: List[float] = []
+    trajectories: List[Dict[str, Any]] = []
+    for ex, full_text, assistant_text in zip(minibatch_examples, raw_outputs, assistant_texts):
+        # Parse ONLY the post-</think> assistant segment
+        parsed = parse_answer_tag(assistant_text or full_text)
+        is_correct = 1.0 if (parsed == ex.gold_label) else 0.0
+        scores.append(is_correct)
+        trajectories.append({
+            "input_text": ex.input_text,
+            "gold_label": ex.gold_label,
+            "model_output_full_text": full_text,
+            "assistant_text": assistant_text,
+            "parsed_label": parsed
+        })
     return raw_outputs, scores, trajectories
+
 
 
 # ===========================================
@@ -490,7 +679,7 @@ def evaluate_split_accuracy(
             task_model=task_model,
             generation_temperature=0.4,
             generation_top_p=0.95,
-            generation_max_new_tokens=192
+            generation_max_new_tokens=2048
         )
         correct += sum(scores)
     return correct / total
@@ -524,7 +713,7 @@ def run_full_eval(
             task_model=task_model,
             generation_temperature=0.4,
             generation_top_p=0.95,
-            generation_max_new_tokens=192
+            generation_max_new_tokens=2048
         )
         correct += sum(scores)
         for t in traj:
@@ -614,7 +803,7 @@ def optimize_instruction_with_reflection(
             task_model=task_model,
             generation_temperature=0.4,
             generation_top_p=0.95,
-            generation_max_new_tokens=192
+            generation_max_new_tokens=2048
         )
         old_sum = sum(old_scores)
 
@@ -637,7 +826,7 @@ def optimize_instruction_with_reflection(
                     task_model=task_model,
                     generation_temperature=0.4,
                     generation_top_p=0.95,
-                    generation_max_new_tokens=192
+                    generation_max_new_tokens=2048
                 )
                 new_sum = sum(new_scores)
                 accepted = new_sum > old_sum
@@ -671,12 +860,13 @@ DEFAULT_SEED_PROMPT = (
     "You evaluate a tutor reply for appropriateness of guidance.\n"
     "Think briefly, then answer with EXACTLY one label.\n\n"
     "FORMAT (strict):\n"
-    "<think> 2–4 short lines of reasoning </think>\n"
+    #"<think> 2–4 short lines of reasoning </think>\n"
     "<answer> Yes|No|To some extent </answer>\n\n"
     "Rubric:\n"
     "1) Identify the student's specific mistake before giving advice.\n"
     "2) When appropriate, provide at least one concrete next step.\n"
-    "3) Avoid generic praise and do not hallucinate details."
+    "3) Avoid generic praise and do not hallucinate details.\n"
+    "4) IT IS CRITICAL THAT YOU ENCLOSE THE ANSWER IN <answer> TAGS, OTHERWISE YOUR ANSWER WILL BE IGNORED\n"
 )
 
 def main():
@@ -686,12 +876,12 @@ def main():
     parser.add_argument("--json_path", type=str, default="/speedy/CisStuff/IndoML/data/trainset.json", help="Path to data/trainset.json")
     parser.add_argument("--target_label", type=str, default="Providing_Guidance",
                         choices=["Providing_Guidance", "Mistake_Identification"])
-    parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--openai_reflector_model", type=str, default="gpt-4o-mini")
 
     # optimize-mode knobs
     parser.add_argument("--iterations", type=int, default=60)
-    parser.add_argument("--minibatch_size", type=int, default=12)
+    parser.add_argument("--minibatch_size", type=int, default=4)
     parser.add_argument("--dev_every", type=int, default=5)
     parser.add_argument("--patience", type=int, default=20)
 
@@ -715,8 +905,9 @@ def main():
 
     # task model (HF)
     print(f"Loading HF task model: {args.hf_task_model}")
-    task_model = SimpleHFChat(args.hf_task_model)
-
+    #task_model = SimpleHFChat(args.hf_task_model)
+    task_model = QwenHFChat(args.hf_task_model)
+    print("Model loaded")
     if args.mode == "evaluate":
         # decide prompt
         prompt = None
@@ -738,7 +929,7 @@ def main():
             splits=splits,
             task_model=task_model,
             eval_splits=wanted,
-            batch_size=max(8, args.minibatch_size),
+            batch_size=args.minibatch_size,
             dump_preds=args.dump_preds
         )
         return
