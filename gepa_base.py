@@ -40,6 +40,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from math import ceil
 from typing import Any, Dict, List, Optional, Tuple
+import tqdm
 
 # =========================
 # Section 0 — types & seed
@@ -166,7 +167,7 @@ class SimpleHFChat:
     def __init__(self, model_name_or_path: str, device: Optional[str] = None, dtype: str = "auto"):
         from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
         self.model_name = model_name_or_path
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, padding_side="left")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             device_map="auto" if device is None else device,
@@ -185,6 +186,7 @@ class SimpleHFChat:
         from transformers import GenerationConfig
         prompts = [system_prompt.strip() + "\n\n" + txt.strip() for txt in user_texts]
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
+
         gen_cfg = GenerationConfig(
             do_sample=True if temperature > 0 else False,
             temperature=temperature,
@@ -496,7 +498,6 @@ def evaluate_split_accuracy(
 # ======================================
 # Section 7.1 — full-set evaluation utils
 # ======================================
-
 def run_full_eval(
     system_prompt: str,
     examples: List[TrainExample],
@@ -515,7 +516,7 @@ def run_full_eval(
     correct = 0.0
     details: List[Dict[str, Any]] = []
 
-    for start in range(0, total, batch_size):
+    for start in tqdm.tqdm(range(0, total, batch_size), desc="Evaluating"):
         ex_batch = examples[start:start + batch_size]
         _, scores, traj = evaluate_minibatch_once(
             current_system_prompt=system_prompt,
@@ -682,10 +683,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["optimize", "evaluate"], default="optimize",
                         help="optimize: run reflective search; evaluate: score a given prompt.")
-    parser.add_argument("--json_path", type=str, required=True, help="Path to data/trainset.json")
+    parser.add_argument("--json_path", type=str, default="/speedy/CisStuff/IndoML/data/trainset.json", help="Path to data/trainset.json")
     parser.add_argument("--target_label", type=str, default="Providing_Guidance",
                         choices=["Providing_Guidance", "Mistake_Identification"])
-    parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--openai_reflector_model", type=str, default="gpt-4o-mini")
 
     # optimize-mode knobs
