@@ -24,14 +24,13 @@ What it does:
   - accuracy scoring using <answer> Yes|No|To some extent
   - uses HF model locally for the task model; uses OpenAI model for reflection
 
-Swap to llama.cpp later:
-  - keep this file; just replace the HF task model wrapper with your llama-server client
 """
 
 from __future__ import annotations
 import argparse
 import hashlib
 import json
+import torch
 import os
 import random
 import sys
@@ -67,6 +66,74 @@ def set_all_seeds(seed: int) -> None:
     except Exception:
         pass
 
+# =========================
+# Track config + seed prompt
+# =========================
+
+TRACK_MI = "Mistake Identification"
+TRACK_PG = "Providing Guidance"
+
+def get_track_name_from_target(target_field: str) -> str:
+    # map your CLI target field to a human-readable track name
+    if target_field.strip().lower() in {"mistake_identification", "mistake identification"}:
+        return TRACK_MI
+    if target_field.strip().lower() in {"providing_guidance", "providing guidance"}:
+        return TRACK_PG
+    # fallback
+    return TRACK_PG
+
+def _shared_output_contract() -> str:
+    return (
+        "OUTPUT FORMAT (must be exact):\n"
+       # "<think>\n"
+       # "- Brief internal reasoning (2–5 bullet points).\n"
+       # "- End with: Decision = {Yes|No|To some extent}\n"
+        #"</think>\n"
+        "<answer> Yes|No|To some extent </answer>\n\n"
+        "Rules:\n"
+        "- Use exactly one of the three labels.\n"
+        "- Do not add extra text after </answer>.\n"
+        "- Be specific to the student’s content; do not invent facts.\n"
+    )
+
+def _track_block(track: str) -> str:
+    if track == TRACK_MI:
+        return (
+            "Track = Mistake Identification\n"
+            "Question: Has the tutor identified/recognized a mistake in the student's response?\n\n"
+            "Label criteria:\n"
+            "- Yes: Precisely names the student’s error (what/where/why). High specificity.\n"
+            "- To some extent: Gestures at the error but is vague/incomplete/partly wrong.\n"
+            "- No: Fails to identify the mistake or misidentifies it.\n\n"
+            "Checklist for <think>:\n"
+            "- Quote or paraphrase the exact student bit that’s wrong (one clause).\n"
+            "- Name the concept/rule violated.\n"
+            "- State in one clause why it’s wrong.\n"
+            "- Map: precise → Yes; vague/partial → To some extent; absent/wrong → No.\n"
+        )
+    else:
+        return (
+            "Track = Providing Guidance\n"
+            "Question: Does the tutor offer correct and relevant guidance (explanation, hint, steps, or example)?\n\n"
+            "Label criteria:\n"
+            "- Yes: Clear, accurate, task-relevant guidance with at least one concrete next step.\n"
+            "- To some extent: Guidance exists but is vague/incomplete/partly inaccurate.\n"
+            "- No: No useful guidance, or misleading/incorrect guidance.\n\n"
+            "Checklist for <think>:\n"
+            "- Is the guidance aligned to the student’s issue?\n"
+            "- Is there a concrete next step (e.g., compute/apply/substitute/rewrite/check)?\n"
+            "- Is the advice accurate and non-hallucinatory?\n"
+            "- Map: clear+accurate+concrete → Yes; vague/partial → To some extent; none/misleading → No.\n"
+        )
+
+def build_seed_prompt(track: str) -> str:
+    return (
+        "You are a strict rater for one task track.\n\n"
+        + _shared_output_contract()
+        + _track_block(track)
+    )
+
+
 
 # =================================
 # Section 1 — data loading/flatten
@@ -78,22 +145,28 @@ def load_raw_conversations(json_path: str) -> List[Dict[str, Any]]:
     assert isinstance(data, list), "Top-level JSON must be a list"
     return data
 
-def render_input_text(conversation_history: str, candidate_tutor_response: str) -> str:
+def render_input_text(conversation_history: str, candidate_tutor_response: str, track: str = TRACK_PG) -> str:
+    if track == TRACK_MI:
+        header = "You are evaluating whether the tutor reply identifies the student's mistake according to the rubric."
+    else:
+        header = "You are evaluating whether the tutor reply provides correct and relevant guidance according to the rubric."
     return (
-        "You are evaluating whether the following tutor reply identifies the student's mistake "
-        "and provides appropriate guidance according to the rubric.\n\n"
+        f"{header}\n\n"
         "=== DIALOGUE CONTEXT ===\n"
         f"{conversation_history.strip()}\n\n"
         "=== CANDIDATE TUTOR RESPONSE TO EVALUATE ===\n"
         f"{candidate_tutor_response.strip()}\n"
     )
 
+
 def flatten_to_examples(
     raw_conversations: List[Dict[str, Any]],
-    target_annotation_field: str = "Providing_Guidance"  # or "Mistake_Identification"
+    target_annotation_field: str = "Providing_Guidance",  # or "Mistake_Identification"
+    track: str = TRACK_PG
 ) -> Tuple[List[TrainExample], Dict[str, int]]:
     examples: List[TrainExample] = []
     label_counts: Dict[str, int] = defaultdict(int)
+    
 
     for conv in raw_conversations:
         conv_history = conv.get("conversation_history", "")
@@ -118,7 +191,7 @@ def flatten_to_examples(
                 continue
             if gold_label not in ALLOWED_LABELS:
                 continue
-            input_text = render_input_text(conv_history, resp_text)
+            input_text = render_input_text(conv_history, resp_text, track)
             examples.append(TrainExample(input_text=input_text, gold_label=gold_label))
             label_counts[gold_label] += 1
 
@@ -158,11 +231,7 @@ def stratified_split(
 
 class SimpleHFChat:
     """
-    Minimal HF text-generation wrapper. Not a true chat; we format:
-      [SYSTEM PROMPT]\n\n[INPUT TEXT]
-    and decode greedily-ish with temperature.
-
-    Swap this with your llama.cpp client later without touching the rest.
+    Minimal HF text-generation wrapper. 
     """
     def __init__(self, model_name_or_path: str, device: Optional[str] = None, dtype: str = "auto"):
         from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
@@ -195,7 +264,7 @@ class SimpleHFChat:
             repetition_penalty=repetition_penalty,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-        with self.model.device:
+        with torch.no_grad():
             outputs = self.model.generate(**inputs, generation_config=gen_cfg)
         # take only the generated tail
         decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -284,6 +353,10 @@ class QwenHFChat:
         #print("Prompts rendered")
         #print(prompts)
         #print("\n\n\n\n\n\n")
+        #print("Prompts: ")
+        #for i in range(len(prompts)):
+        #    print(f"Prompt {i}: ", prompts[i])
+        #    print("\n\n\n\n\n\n")
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
 
         gen_cfg = GenerationConfig(
@@ -322,7 +395,12 @@ class QwenHFChat:
             #print("Content ids: ", content_ids)
             thinking_content = self.tokenizer.decode(think_ids, skip_special_tokens=True).strip()
             assistant_content = self.tokenizer.decode(content_ids, skip_special_tokens=True).strip()
-            print(assistant_content)
+            #print(assistant_content)
+            #for i in range(len(thinking_content)):
+            #    print(f"Thinking content {i}: ", thinking_content[i])
+            #for i in range(len(assistant_content)):
+                #print(f"Assistant content {i}: ", assistant_content[i])
+            #print("Assistant content: ", assistant_content)
             if thinking_content and assistant_content:
                 full_text = (thinking_content + "\n" + assistant_content).strip()
             else:
@@ -366,47 +444,6 @@ def parse_answer_tag(text: str) -> Optional[str]:
         if lbl.lower() in candidate:
             return lbl
     return None
-'''
-def evaluate_minibatch_once(
-    current_system_prompt: str,
-    minibatch_examples: List[TrainExample],
-    task_model: SimpleHFChat,
-    generation_temperature: float = 0.4,
-    generation_top_p: float = 0.95,
-    generation_max_new_tokens: int = 192,
-) -> Tuple[List[str], List[float], List[Dict[str, Any]]]:
-    """
-    Returns:
-      raw_outputs: list of model texts
-      scores: list of 0/1 accuracies
-      trajectories: list of dicts with input_text, gold_label, model_output_full_text, parsed_label
-    """
-    user_inputs = [ex.input_text for ex in minibatch_examples]
-    try:
-        raw_outputs = task_model.generate(
-            system_prompt=current_system_prompt,
-            user_texts=user_inputs,
-            temperature=generation_temperature,
-            top_p=generation_top_p,
-            max_new_tokens=generation_max_new_tokens,
-        )
-    except Exception as e:
-        # If generation fails entirely, return zeros
-        raw_outputs = [""] * len(user_inputs)
-
-    scores: List[float] = []
-    trajectories: List[Dict[str, Any]] = []
-    for ex, out in zip(minibatch_examples, raw_outputs):
-        parsed = parse_answer_tag(out)
-        is_correct = 1.0 if (parsed == ex.gold_label) else 0.0
-        scores.append(is_correct)
-        trajectories.append({
-            "input_text": ex.input_text,
-            "gold_label": ex.gold_label,
-            "model_output_full_text": out,
-            "parsed_label": parsed
-        })
-    return raw_outputs, scores, trajectories'''
 
 def evaluate_minibatch_once(
     current_system_prompt: str,
@@ -416,15 +453,7 @@ def evaluate_minibatch_once(
     generation_top_p: float = 0.95,
     generation_max_new_tokens: int = 2048,
 ) -> Tuple[List[str], List[float], List[Dict[str, Any]]]:
-    """
-    Returns:
-      raw_outputs: list of FULL model texts (thinking + content) for logging
-      scores: list of 0/1 accuracies
-      trajectories: list of dicts with input_text, gold_label, model_output_full_text, assistant_text, parsed_label
-    """
     user_inputs = [ex.input_text for ex in minibatch_examples]
-
-    # Prefer Qwen path that returns (full_text, assistant_text)
     has_qwen_api = hasattr(task_model, "generate_full_and_assistant")
 
     try:
@@ -439,33 +468,36 @@ def evaluate_minibatch_once(
             raw_outputs = [ft for (ft, _) in pairs]
             assistant_texts = [at for (_, at) in pairs]
         else:
-            # Fallback: old wrapper returns a single string; parse that directly.
             raw_outputs = task_model.generate(
                 system_prompt=current_system_prompt,
                 user_texts=user_inputs,
                 temperature=generation_temperature,
-                top_p=generation_top_new_tokens,
+                top_p=generation_top_p,
                 max_new_tokens=generation_max_new_tokens,
             )
-            assistant_texts = list(raw_outputs)  # no split available
+            assistant_texts = list(raw_outputs)
     except Exception:
-        # Robust to transient generation failures
         raw_outputs = [""] * len(user_inputs)
         assistant_texts = [""] * len(user_inputs)
 
     scores: List[float] = []
     trajectories: List[Dict[str, Any]] = []
     for ex, full_text, assistant_text in zip(minibatch_examples, raw_outputs, assistant_texts):
-        # Parse ONLY the post-</think> assistant segment
+        text_for_tag = assistant_text or full_text
+        had_tag = ("<answer>" in text_for_tag.lower() and "</answer>" in text_for_tag.lower())
         parsed = parse_answer_tag(assistant_text or full_text)
+        off_vocab = bool(had_tag and (parsed is None))  # tag present but not one of allowed labels
         is_correct = 1.0 if (parsed == ex.gold_label) else 0.0
+
         scores.append(is_correct)
         trajectories.append({
             "input_text": ex.input_text,
             "gold_label": ex.gold_label,
             "model_output_full_text": full_text,
             "assistant_text": assistant_text,
-            "parsed_label": parsed
+            "parsed_label": parsed,
+            "had_answer_tag": had_tag,
+            "off_vocab_label": off_vocab,
         })
     return raw_outputs, scores, trajectories
 
@@ -522,41 +554,73 @@ class ClassBalancedSampler:
 # Section 5 — reflection casebook (examples)
 # ==========================================
 
-def _short_feedback(gold: str, pred: Optional[str], had_answer_tag: bool) -> str:
+_ACTION_VERBS = {"compute", "calculate", "substitute", "apply", "rewrite",
+                 "differentiate", "integrate", "expand", "factor", "check",
+                 "verify", "simplify", "try", "show", "solve"}
+
+def _has_action_step(text: str) -> bool:
+    lo = (text or "").lower()
+    return any(v in lo for v in _ACTION_VERBS)
+
+def _has_pinpoint(text: str) -> bool:
+    lo = (text or "").lower()
+    # very light signals the model actually points to a concrete error
+    return any(p in lo for p in ["mistake", "error", "because", "at step", "incorrect", "should be"]) or ("“" in lo or "\"" in lo)
+
+def short_feedback(track: str, gold: str, pred: Optional[str], had_answer_tag: bool, assistant_text: str) -> str:
     if not had_answer_tag:
-        return "Output is missing the required <answer> tag with exactly one of {Yes, No, To some extent}."
-    if gold == "Yes":
-        if pred != "Yes":
-            return "Reply lacks actionable guidance; add at least one concrete next step aligned to the rubric."
-        return "Correct: guidance present and actionable."
-    if gold == "No":
-        if pred != "No":
-            return "Reply does not identify the student’s mistake; first name the specific error before advising."
-        return "Correct: mistake identified; inappropriate guidance avoided."
-    # gold == "To some extent"
-    if pred != "To some extent":
-        return "Partial guidance: require explicit mistake identification and at least one concrete next step."
-    return "Correct: partial guidance with adequate scaffolding."
+        return "Output is missing a single <answer> tag with exactly one of {Yes, No, To some extent}. Add it and remove any extra text after the tag."
+    if pred is None:
+        return "The label inside <answer> must be exactly one of {Yes, No, To some extent}; do not use synonyms or add words."
+
+    if track == TRACK_MI:
+        if gold == "Yes" and pred != "Yes":
+            return "Name the specific student error (what/where/why) and reference the offending step; vague topic-level comments are insufficient. The correct answer is Yes."
+        if gold == "To some extent" and pred == "No":
+            return "You noticed the area but missed precision; state the exact incorrect step or concept and why it’s wrong. The correct answer is To some extent."
+        if gold == "No" and pred != "No":
+            return "You asserted an error that isn’t present; avoid inventing mistakes and only label Yes when a concrete error is identified. The correct answer is No."
+        elif gold != pred:
+            return "The correct answer is " + gold + "."
+        #if pred == "Yes" and not _has_pinpoint(assistant_text):
+        #    return "“Yes” requires precision: point to the exact student step and the violated rule before labeling."
+        return "Correct under the MI rubric."
+    else:
+        # TRACK_PG
+        if gold == "Yes" and pred != "Yes":
+            return "Provide one concrete, accurate next step aligned with the student’s issue (e.g., compute/apply/substitute/rewrite)."
+        if gold == "To some extent" and pred == "No":
+            return "Some guidance exists but is vague; add a specific action or example to make it usable."
+        if gold == "No" and pred != "No":
+            return "The advice is incorrect or off-target; remove misleading steps and only guide when aligned to the student’s need."
+        #if pred == "Yes" and not _has_action_step(assistant_text):
+        #    return "“Yes” requires at least one actionable step; add a concrete instruction rather than generic encouragement."
+        if gold != pred:
+            return "The correct answer is " + gold + "."
+        return "Correct under the PG rubric."
 
 def build_reflection_casebook(
     trajectories: List[Dict[str, Any]],
+    track: str,
     k_fail: int = 6,
     k_pass: int = 2
 ) -> List[Dict[str, Any]]:
     fails: List[Dict[str, Any]] = []
     passes: List[Dict[str, Any]] = []
     for t in trajectories:
-        gold = t["gold_label"]
-        pred = t.get("parsed_label")
-        out_text = t["model_output_full_text"]
-        had_answer_tag = (pred is not None)
-        fb = _short_feedback(gold, pred, had_answer_tag)
+        fb = short_feedback(
+            track=track,
+            gold=t["gold_label"],
+            pred=t.get("parsed_label"),
+            had_answer_tag=bool(t.get("had_answer_tag")),
+            assistant_text=t.get("assistant_text") or t.get("model_output_full_text") or "",
+        )
         rec = {
             "Inputs": t["input_text"],
-            "Generated Outputs": out_text,
+            "Generated Outputs": t["model_output_full_text"],
             "Feedback": fb,
         }
-        if pred == gold and pred is not None:
+        if t.get("parsed_label") == t["gold_label"] and t.get("parsed_label") is not None:
             passes.append(rec)
         else:
             fails.append(rec)
@@ -571,18 +635,15 @@ def build_reflection_casebook(
     return selected[: (k_fail + k_pass)]
 
 
+
 # ==========================================
 # Section 6 — reflector (OpenAI Chat wrapper)
 # ==========================================
 
-try:
-    from openai import OpenAI  # pip install openai>=1.30
-except Exception:
-    OpenAI = None  # we'll error at construction if used
 
 ALLOWED_LABELS_TEXT = "Yes|No|To some extent"
 
-def _render_reflection_prompt(current_instruction: str, casebook: List[Dict[str, Any]]) -> str:
+def _render_reflection_prompt(current_instruction: str, casebook: List[Dict[str, Any]], track: str) -> str:
     def render_item(i: int, rec: Dict[str, Any]) -> str:
         return (
             f"# Example {i}\n"
@@ -592,24 +653,24 @@ def _render_reflection_prompt(current_instruction: str, casebook: List[Dict[str,
         )
     examples_text = "\n\n".join(render_item(i+1, rec) for i, rec in enumerate(casebook))
     return (
-        "You are revising an instruction for a classifier that must output EXACTLY one label inside an <answer> tag.\n"
+        "You are revising an instruction for a classifier LLM that must output EXACTLY one label inside an <answer> tag.\n"
         f"Allowed labels are: {ALLOWED_LABELS_TEXT}\n\n"
-        "The classifier should briefly think, then output the label.\n"
-        "Here is the current instruction:\n```"
+        + _shared_output_contract()
+        + _track_block(track)
+        + "\nHere is the current instruction:\n```"
         f"{current_instruction}"
         "```\n\n"
-        "Below are examples of inputs, the model's outputs, and feedback on how to improve:\n"
+        "Below are inputs, model outputs, and targeted feedback:\n"
         "```\n"
         f"{examples_text}\n"
         "```\n\n"
+        "Analyse the model's outputs and the thinking process--checking for alignment with the feedback and analysing failure cases.\n"
         "Write a revised instruction that:\n"
-        "  1) Keeps the exact output contract:\n"
-        "     <think>…</think>\n"
-        f"     <answer> {ALLOWED_LABELS_TEXT} </answer>\n"
-        "  2) Emphasizes: identify the student’s mistake before guidance; provide at least one concrete next step when guidance is appropriate; avoid generic praise; avoid hallucinating details.\n"
-        "  3) States the allowed labels explicitly.\n\n"
+        "  1) Preserves the exact output format and this track’s label criteria.\n"
+        "  2) Strengthens any weak points identified in feedback (precision, concrete steps, alignment, non-hallucination).\n"
         "Return ONLY the new instruction inside triple backticks.\n"
     )
+
 
 def _parse_backticked_instructions(text: str) -> Optional[str]:
     if "```" not in text:
@@ -625,35 +686,60 @@ def _passes_contract(new_instruction: str) -> bool:
     must_have = ["<answer>", "</answer>", "Yes", "No", "To some extent"]
     return all(tok in new_instruction for tok in must_have)
 
+def count_contract_violations(trajs: List[Dict[str, Any]]) -> Dict[str, int]:
+    missing = sum(0 if t.get("had_answer_tag") else 1 for t in trajs)
+    offvocab = sum(1 if t.get("off_vocab_label") else 0 for t in trajs)
+    return {"missing_tag": missing, "off_vocab": offvocab}
+
+from groq import Groq
+from google import genai
+from openai import OpenAI
 class OpenAIReflector:
-    def __init__(self, model_name: str = "gpt-4o-mini", timeout_seconds: float = 60.0, max_retries: int = 4):
-        if OpenAI is None:
-            raise RuntimeError("openai package not available. `pip install openai>=1.30`")
-        self.client = OpenAI(timeout=timeout_seconds)
+    def __init__(self, model_name: str = "deepseek-r1-distill-llama-70b", timeout_seconds: float = 60.0, max_retries: int = 4):
+        #if OpenAI is None:
+         #   raise RuntimeError("openai package not available. `pip install openai>=1.30`")
+        
+        #self.client = Groq()
+        #self.client = genai.Client()
+        self.client = OpenAI()
         self.model_name = model_name
         self.max_retries = max_retries
 
-    def propose_new_prompt(self, current_instruction: str, casebook: List[Dict[str, Any]]) -> Optional[str]:
-        prompt_text = _render_reflection_prompt(current_instruction, casebook)
+    def propose_new_prompt(self, current_instruction: str, casebook: List[Dict[str, Any]], track: str) -> Optional[str]:
+        prompt_text = _render_reflection_prompt(current_instruction, casebook, track)
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
+                # Save prompt to tmp.txt for debugging
+                with open("tmp.txt", "w", encoding="utf-8") as f:
+                    f.write(prompt_text)
                 resp = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[{"role": "user", "content": prompt_text}],
-                    temperature=0.8,
-                    top_p=0.95,
-                    max_tokens=800
+                    #temperature=0.8,
+                    #top_p=0.95,
+                    #max_tokens=8192
                 )
-                text = resp.choices[0].message.content or ""
+                '''
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt_text,
+                )'''
+
+                text = resp.choices[0].message.content
+                #text = response.text
+                print("Text: ", text)
                 new_inst = _parse_backticked_instructions(text)
+                print("New instruction: ", new_inst)
                 if new_inst and _passes_contract(new_inst):
                     return new_inst
                 last_err = RuntimeError("Reflector returned invalid or missing backticked instruction.")
             except Exception as e:
                 last_err = e
+                print("Error: ", e)
             time.sleep(1.2 * (2 ** attempt))
         return None
+
 
 
 # ======================================
@@ -776,13 +862,14 @@ def optimize_instruction_with_reflection(
     seed_system_prompt: str,
     train_examples: List[TrainExample],
     dev_examples: List[TrainExample],
-    task_model: SimpleHFChat,
+    task_model: Any,
     reflector: OpenAIReflector,
     num_iterations: int = 100,
     minibatch_size: int = 12,
     dev_every: int = 5,
     patience: int = 25,
-    global_seed: int = 17
+    global_seed: int = 17,
+    track: str = TRACK_PG,
 ) -> Tuple[str, float]:
     set_all_seeds(global_seed)
     sampler = ClassBalancedSampler(build_label_index(train_examples), global_seed)
@@ -792,7 +879,7 @@ def optimize_instruction_with_reflection(
     best_dev_acc = 0.0
     iters_since_accept = 0
 
-    for iteration in range(1, num_iterations + 1):
+    for iteration in tqdm.tqdm(range(1, num_iterations + 1)):
         batch_indices = sampler.sample_indices(minibatch_size)
         minibatch = [train_examples[i] for i in batch_indices]
 
@@ -805,22 +892,22 @@ def optimize_instruction_with_reflection(
             generation_top_p=0.95,
             generation_max_new_tokens=2048
         )
+        print("Old scores: ", old_scores)
         old_sum = sum(old_scores)
+        old_v = count_contract_violations(old_traj)
 
         if old_sum == len(minibatch):
             print(f"[iter {iteration:03d}] batch perfect ({old_sum}/{len(minibatch)}). skip reflection.")
             iters_since_accept += 1
         else:
-            # build casebook
-            casebook = build_reflection_casebook(old_traj, k_fail=6, k_pass=2)
-            # reflect
-            proposed_prompt = reflector.propose_new_prompt(current_prompt, casebook)
+            casebook = build_reflection_casebook(old_traj, track=track, k_fail=6, k_pass=2)
+            proposed_prompt = reflector.propose_new_prompt(current_prompt, casebook, track=track)
             if proposed_prompt is None:
                 print(f"[iter {iteration:03d}] reflection failed; keep current.")
                 iters_since_accept += 1
             else:
                 # strict A/B on same batch
-                _, new_scores, _ = evaluate_minibatch_once(
+                _, new_scores, new_traj = evaluate_minibatch_once(
                     current_system_prompt=proposed_prompt,
                     minibatch_examples=minibatch,
                     task_model=task_model,
@@ -829,14 +916,36 @@ def optimize_instruction_with_reflection(
                     generation_max_new_tokens=2048
                 )
                 new_sum = sum(new_scores)
-                accepted = new_sum > old_sum
+                new_v = count_contract_violations(new_traj)
+
+                # Acceptance rule:
+                # 1) must improve accuracy; and
+                # 2) must not increase contract violations; and
+                # 3) off-vocab must be zero (hard guard).
+                improved = new_sum > old_sum
+                contract_ok = (new_v["missing_tag"] <= old_v["missing_tag"]) and (new_v["off_vocab"] <= old_v["off_vocab"])
+                hard_guard = (new_v["off_vocab"] == 0)
+
+                accepted = bool(improved and contract_ok and hard_guard)
                 status = "ACCEPT" if accepted else "reject"
-                print(f"[iter {iteration:03d}] {status} old={old_sum:.0f} new={new_sum:.0f} prompt={_prompt_sha1(proposed_prompt)}")
+                if accepted:
+                    with open("accepted_prompt.txt", "w", encoding="utf-8") as f:
+                        f.write(proposed_prompt)
+                    
+                more = f"old={old_sum:.0f}/{len(minibatch)} v={old_v} new={new_sum:.0f}/{len(minibatch)} v={new_v}"
+                print(f"[iter {iteration:03d}] {status} {more} prompt={_prompt_sha1(proposed_prompt)}")
+
                 if accepted:
                     current_prompt = proposed_prompt
                     iters_since_accept = 0
                 else:
-                    iters_since_accept += 1
+                    # secondary tie-break: if accuracy ties but strictly fewer violations, you may allow:
+                    if (new_sum == old_sum) and ( (new_v["missing_tag"] < old_v["missing_tag"]) or (new_v["off_vocab"] < old_v["off_vocab"]) ) and hard_guard:
+                        print(f"[iter {iteration:03d}] ACCEPT (tie on acc, fewer violations).")
+                        current_prompt = proposed_prompt
+                        iters_since_accept = 0
+                    else:
+                        iters_since_accept += 1
 
         if (iteration % dev_every) == 0:
             dev_acc = evaluate_split_accuracy(current_prompt, dev_examples, task_model, minibatch_size=12)
@@ -850,6 +959,7 @@ def optimize_instruction_with_reflection(
             break
 
     return best_prompt, best_dev_acc
+
 
 
 # =========================
@@ -874,10 +984,10 @@ def main():
     parser.add_argument("--mode", choices=["optimize", "evaluate"], default="optimize",
                         help="optimize: run reflective search; evaluate: score a given prompt.")
     parser.add_argument("--json_path", type=str, default="/speedy/CisStuff/IndoML/data/trainset.json", help="Path to data/trainset.json")
-    parser.add_argument("--target_label", type=str, default="Providing_Guidance",
+    parser.add_argument("--target_label", type=str, default="Mistake_Identification",
                         choices=["Providing_Guidance", "Mistake_Identification"])
     parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--openai_reflector_model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--openai_reflector_model", type=str, default="deepseek-r1-distill-llama-70b")
 
     # optimize-mode knobs
     parser.add_argument("--iterations", type=int, default=60)
@@ -895,13 +1005,18 @@ def main():
     args = parser.parse_args()
 
     # load + flatten
+    track = get_track_name_from_target(args.target_label)
     raw = load_raw_conversations(args.json_path)
-    examples, counts = flatten_to_examples(raw, target_annotation_field=args.target_label)
+    examples, counts = flatten_to_examples(raw, target_annotation_field=args.target_label, track=track)
     print(f"Loaded {len(examples)} examples; label_counts={counts}")
 
     # split
     train, dev, test = stratified_split(examples, 0.8, 0.1, 0.1, rng_seed=args.seed)
     print(f"Split sizes: train={len(train)} dev={len(dev)} test={len(test)}")
+
+    
+    seed_prompt = build_seed_prompt(track)
+
 
     # task model (HF)
     print(f"Loading HF task model: {args.hf_task_model}")
@@ -916,8 +1031,8 @@ def main():
         elif args.prompt_path and os.path.exists(args.prompt_path):
             prompt = open(args.prompt_path, "r", encoding="utf-8").read()
         else:
-            prompt = DEFAULT_SEED_PROMPT
-            print("[EVAL] No --prompt_text/--prompt_path provided; using DEFAULT_SEED_PROMPT.")
+            prompt = seed_prompt
+            print("[EVAL] No --prompt_text/--prompt_path provided; using track-specific seed prompt.")
 
         # which splits to eval
         wanted = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
@@ -942,7 +1057,7 @@ def main():
 
     # optimize
     best_prompt, best_dev_acc = optimize_instruction_with_reflection(
-        seed_system_prompt=DEFAULT_SEED_PROMPT,
+        seed_system_prompt=seed_prompt,
         train_examples=train,
         dev_examples=dev,
         task_model=task_model,
@@ -951,7 +1066,8 @@ def main():
         minibatch_size=args.minibatch_size,
         dev_every=args.dev_every,
         patience=args.patience,
-        global_seed=args.seed
+        global_seed=args.seed,
+        track=track
     )
 
     # final eval on test with best prompt
