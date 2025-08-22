@@ -8,22 +8,23 @@ GEPA-min (one file, readable): reflective prompt evolution loop for classificati
 Quick start:
   pip install "transformers>=4.43" "torch>=2.1" "openai>=1.30" datasets
 
-Run:
+Run (epochal restarts; 3 finalists):
   python gepa_min.py \
     --json_path data/trainset.json \
     --target_label Providing_Guidance \
     --hf_task_model Qwen/Qwen2.5-0.5B-Instruct \
     --openai_reflector_model gpt-4o-mini \
-    --iterations 40
+    --epochs 3 --iters_per_epoch 20 \
+    --final_val_frac 0.5
 
 What it does:
   - loads your JSON (conversation_history + tutor_responses[*].response + .annotation[label])
-  - stratified train/dev/test split
+  - stratified train/dev/test split; dev further split into dev_loop + final_val
   - class-balanced minibatch sampling
   - acceptance loop: (prompt -> outputs -> casebook -> big LLM -> new prompt) with strict A/B on same batch
   - accuracy scoring using <answer> Yes|No|To some extent
-  - uses HF model locally for the task model; uses OpenAI model for reflection
-
+  - uses HF model locally for the task model; uses OpenAI (or compatible) for reflection
+  - restarts from seed each epoch; keeps the best prompt per epoch as a finalist; picks champion on final_val, reports test once
 """
 
 from __future__ import annotations
@@ -74,21 +75,15 @@ TRACK_MI = "Mistake Identification"
 TRACK_PG = "Providing Guidance"
 
 def get_track_name_from_target(target_field: str) -> str:
-    # map your CLI target field to a human-readable track name
     if target_field.strip().lower() in {"mistake_identification", "mistake identification"}:
         return TRACK_MI
     if target_field.strip().lower() in {"providing_guidance", "providing guidance"}:
         return TRACK_PG
-    # fallback
     return TRACK_PG
 
 def _shared_output_contract() -> str:
     return (
         "OUTPUT FORMAT (must be exact):\n"
-       # "<think>\n"
-       # "- Brief internal reasoning (2–5 bullet points).\n"
-       # "- End with: Decision = {Yes|No|To some extent}\n"
-        #"</think>\n"
         "<answer> Yes|No|To some extent </answer>\n\n"
         "Rules:\n"
         "- Use exactly one of the three labels.\n"
@@ -133,8 +128,6 @@ def build_seed_prompt(track: str) -> str:
         + _track_block(track)
     )
 
-
-
 # =================================
 # Section 1 — data loading/flatten
 # =================================
@@ -158,15 +151,13 @@ def render_input_text(conversation_history: str, candidate_tutor_response: str, 
         f"{candidate_tutor_response.strip()}\n"
     )
 
-
 def flatten_to_examples(
     raw_conversations: List[Dict[str, Any]],
-    target_annotation_field: str = "Providing_Guidance",  # or "Mistake_Identification"
+    target_annotation_field: str = "Providing_Guidance",
     track: str = TRACK_PG
 ) -> Tuple[List[TrainExample], Dict[str, int]]:
     examples: List[TrainExample] = []
     label_counts: Dict[str, int] = defaultdict(int)
-    
 
     for conv in raw_conversations:
         conv_history = conv.get("conversation_history", "")
@@ -212,7 +203,7 @@ def stratified_split(
     train: List[TrainExample] = []
     dev:   List[TrainExample] = []
     test:  List[TrainExample] = []
-    for label, items in by_label.items():
+    for _, items in by_label.items():
         random.shuffle(items)
         n = len(items)
         n_train = int(round(n * train_frac))
@@ -224,17 +215,38 @@ def stratified_split(
     random.shuffle(train); random.shuffle(dev); random.shuffle(test)
     return train, dev, test
 
+# --- NEW: stratified sub-split of dev into dev_loop + final_val ---
+def stratified_subsplit(
+    examples: List[TrainExample],
+    final_val_frac: float = 0.5,
+    rng_seed: int = 42
+) -> Tuple[List[TrainExample], List[TrainExample]]:
+    """Return (dev_loop, final_val) as a stratified split of `examples`."""
+    final_val_frac = max(0.05, min(0.95, float(final_val_frac)))
+    set_all_seeds(rng_seed)
+    by_label: Dict[str, List[TrainExample]] = defaultdict(list)
+    for ex in examples:
+        by_label[ex.gold_label].append(ex)
+    dev_loop: List[TrainExample] = []
+    final_val: List[TrainExample] = []
+    for _, items in by_label.items():
+        random.shuffle(items)
+        n = len(items)
+        n_final = int(round(n * final_val_frac))
+        n_final = min(max(n_final, 1 if n >= 2 else 0), n - 1 if n >= 2 else n)  # keep both non-empty when possible
+        final_val.extend(items[:n_final])
+        dev_loop.extend(items[n_final:])
+    random.shuffle(dev_loop); random.shuffle(final_val)
+    return dev_loop, final_val
 
 # =======================================
 # Section 2 — task model (HF transformers)
 # =======================================
 
 class SimpleHFChat:
-    """
-    Minimal HF text-generation wrapper. 
-    """
+    """Minimal HF text-generation wrapper."""
     def __init__(self, model_name_or_path: str, device: Optional[str] = None, dtype: str = "auto"):
-        from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+        from transformers import AutoTokenizer, AutoModelForCausalLM
         self.model_name = model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, padding_side="left")
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -243,7 +255,6 @@ class SimpleHFChat:
             torch_dtype=dtype if dtype != "auto" else None,
             trust_remote_code=True
         )
-        self.streamer = None  # could plug a streamer for debugging
 
     def generate(self,
                  system_prompt: str,
@@ -253,11 +264,13 @@ class SimpleHFChat:
                  max_new_tokens: int = 192,
                  repetition_penalty: float = 1.05) -> List[str]:
         from transformers import GenerationConfig
-        prompts = [system_prompt.strip() + "\n\n" + txt.strip() for txt in user_texts]
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
+        inputs = self.tokenizer(
+            [system_prompt.strip() + "\n\n" + txt.strip() for txt in user_texts],
+            return_tensors="pt", padding=True
+        ).to(self.model.device)
 
         gen_cfg = GenerationConfig(
-            do_sample=True if temperature > 0 else False,
+            do_sample=(temperature > 0),
             temperature=temperature,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
@@ -266,49 +279,35 @@ class SimpleHFChat:
         )
         with torch.no_grad():
             outputs = self.model.generate(**inputs, generation_config=gen_cfg)
-        # take only the generated tail
         decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        # the decode returns whole prompt+completion; clip heuristic:
         results = []
-        for full, prefix in zip(decoded, prompts):
-            if full.startswith(prefix):
-                results.append(full[len(prefix):].strip())
-            else:
-                results.append(full.strip())
+        for full, prefix in zip(decoded, self.tokenizer.batch_decode(inputs.input_ids, skip_special_tokens=True)):
+            # clip heuristic
+            results.append(full[len(prefix):].strip() if full.startswith(prefix) else full.strip())
         return results
 
 class QwenHFChat:
     """
-    Qwen-flavored chat wrapper that:
+    Qwen chat wrapper that:
       - builds proper chat messages (system + user)
       - uses apply_chat_template(..., enable_thinking=True)
       - splits the generated text at the last </think> token (if present)
-    Returns both full text (thinking + content) and assistant-only content.
     """
     def __init__(self, model_name_or_path: str, device: Optional[str] = None, dtype: str = "auto"):
         from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
-
         self.model_name = model_name_or_path
-        print("Model name loaded")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path,
             trust_remote_code=True,
-            padding_side="left"  # important for decoder-only
+            padding_side="left"
         )
-        print("Tokenizer loaded")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            #device_map=torch.device("cuda"),
-            torch_dtype=torch.bfloat16, #dtype if dtype != "auto" else None,
-            #trust_remote_code=True
+            torch_dtype=torch.bfloat16,
         )
-        self.model.to(torch.device("cuda"))
+        self.model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.eval()
-        print("Model loaded internally")
-
-        # Resolve the special token id for </think> once, safely.
-        # Do NOT hardcode magic ids like 151668.
         try:
             self.end_think_id = self.tokenizer.convert_tokens_to_ids("</think>")
             if not isinstance(self.end_think_id, int) or self.end_think_id <= 0:
@@ -327,7 +326,7 @@ class QwenHFChat:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True  # let Qwen open a <think> ... </think> block
+                enable_thinking=True
             )
             rendered.append(text)
         return rendered
@@ -341,22 +340,13 @@ class QwenHFChat:
         max_new_tokens: int = 256,
         repetition_penalty: float = 1.05,
     ) -> List[tuple[str, str]]:
-        """
-        Returns a list of (full_text, assistant_text) for each input:
-          - full_text: decoded "thinking + content" (nice for logs)
-          - assistant_text: only the post-</think> segment (parse this!)
-        """
         import torch
         from transformers import GenerationConfig
 
+        print("System Prompt: ", system_prompt)
+        print("User Texts: ", user_texts[0])
+
         prompts = self._render_batch_prompts(system_prompt, user_texts)
-        #print("Prompts rendered")
-        #print(prompts)
-        #print("\n\n\n\n\n\n")
-        #print("Prompts: ")
-        #for i in range(len(prompts)):
-        #    print(f"Prompt {i}: ", prompts[i])
-        #    print("\n\n\n\n\n\n")
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
 
         gen_cfg = GenerationConfig(
@@ -372,74 +362,47 @@ class QwenHFChat:
             outputs = self.model.generate(**inputs, generation_config=gen_cfg)
 
         results: List[tuple[str, str]] = []
-        input_lens = [int(row.shape[0]) for row in inputs.input_ids]  # per-example prompt length
+        input_lens = [int(row.shape[0]) for row in inputs.input_ids]
 
         for i in range(outputs.shape[0]):
             full_ids = outputs[i].tolist()
-            tail_ids = full_ids[input_lens[i]:]  # only the generated continuation
-
-            # Split tail at the last </think>, if that token id exists
+            tail_ids = full_ids[input_lens[i]:]
             assistant_start = 0
             if self.end_think_id is not None:
                 try:
-                    # reverse search for the last occurrence
                     rev_index = tail_ids[::-1].index(self.end_think_id)
                     last_pos = len(tail_ids) - 1 - rev_index
                     assistant_start = last_pos + 1
                 except ValueError:
-                    assistant_start = 0  # no </think> found in the tail
+                    assistant_start = 0
 
             think_ids = tail_ids[:assistant_start]
             content_ids = tail_ids[assistant_start:]
-            #print("Think ids: ", think_ids)
-            #print("Content ids: ", content_ids)
             thinking_content = self.tokenizer.decode(think_ids, skip_special_tokens=True).strip()
             assistant_content = self.tokenizer.decode(content_ids, skip_special_tokens=True).strip()
-            #print(assistant_content)
-            #for i in range(len(thinking_content)):
-            #    print(f"Thinking content {i}: ", thinking_content[i])
-            #for i in range(len(assistant_content)):
-                #print(f"Assistant content {i}: ", assistant_content[i])
-            #print("Assistant content: ", assistant_content)
-            if thinking_content and assistant_content:
-                full_text = (thinking_content + "\n" + assistant_content).strip()
-            else:
-                # if we couldn't split, the "assistant_content" is the whole decode
-                full_text = (thinking_content or assistant_content).strip()
-
+            full_text = (thinking_content + "\n" + assistant_content).strip() if (thinking_content and assistant_content) else (thinking_content or assistant_content).strip()
             results.append((full_text, assistant_content))
-        #print(results)
-
         return results
-
-
 
 # ======================================
 # Section 3 — parsing + minibatch scoring
 # ======================================
 
 def parse_answer_tag(text: str) -> Optional[str]:
-    """
-    Extract the label inside <answer>...</answer>, normalize to canonical label if possible.
-    """
     lo = text.lower()
     if "<answer>" not in lo or "</answer>" not in lo:
         return None
     try:
         start = lo.index("<answer>") + len("<answer>")
         end = lo.index("</answer>", start)
-        raw = text[start:end].strip()  # slice original text to keep case
+        raw = text[start:end].strip()
     except Exception:
         return None
-    # normalize to our canonical set
     candidate = raw.strip().lower()
-    if candidate == "yes":
-        return "Yes"
-    if candidate == "no":
-        return "No"
+    if candidate == "yes": return "Yes"
+    if candidate == "no": return "No"
     if candidate in {"to some extent", "to_some_extent", "partial", "partially"}:
         return "To some extent"
-    # allow pipe form: Yes|No|To some extent (pick first token if they echoed)
     for lbl in ALLOWED_LABELS:
         if lbl.lower() in candidate:
             return lbl
@@ -451,7 +414,7 @@ def evaluate_minibatch_once(
     task_model: Any, 
     generation_temperature: float = 0.2,
     generation_top_p: float = 0.95,
-    generation_max_new_tokens: int = 2048,
+    generation_max_new_tokens: int = 1024,
 ) -> Tuple[List[str], List[float], List[Dict[str, Any]]]:
     user_inputs = [ex.input_text for ex in minibatch_examples]
     has_qwen_api = hasattr(task_model, "generate_full_and_assistant")
@@ -486,7 +449,7 @@ def evaluate_minibatch_once(
         text_for_tag = assistant_text or full_text
         had_tag = ("<answer>" in text_for_tag.lower() and "</answer>" in text_for_tag.lower())
         parsed = parse_answer_tag(assistant_text or full_text)
-        off_vocab = bool(had_tag and (parsed is None))  # tag present but not one of allowed labels
+        off_vocab = bool(had_tag and (parsed is None))
         is_correct = 1.0 if (parsed == ex.gold_label) else 0.0
 
         scores.append(is_correct)
@@ -500,8 +463,6 @@ def evaluate_minibatch_once(
             "off_vocab_label": off_vocab,
         })
     return raw_outputs, scores, trajectories
-
-
 
 # ===========================================
 # Section 4 — class-balanced minibatch sampler
@@ -549,7 +510,6 @@ class ClassBalancedSampler:
         random.shuffle(batch)
         return batch
 
-
 # ==========================================
 # Section 5 — reflection casebook (examples)
 # ==========================================
@@ -564,7 +524,6 @@ def _has_action_step(text: str) -> bool:
 
 def _has_pinpoint(text: str) -> bool:
     lo = (text or "").lower()
-    # very light signals the model actually points to a concrete error
     return any(p in lo for p in ["mistake", "error", "because", "at step", "incorrect", "should be"]) or ("“" in lo or "\"" in lo)
 
 def short_feedback(track: str, gold: str, pred: Optional[str], had_answer_tag: bool, assistant_text: str) -> str:
@@ -572,7 +531,6 @@ def short_feedback(track: str, gold: str, pred: Optional[str], had_answer_tag: b
         return "Output is missing a single <answer> tag with exactly one of {Yes, No, To some extent}. Add it and remove any extra text after the tag."
     if pred is None:
         return "The label inside <answer> must be exactly one of {Yes, No, To some extent}; do not use synonyms or add words."
-
     if track == TRACK_MI:
         if gold == "Yes" and pred != "Yes":
             return "Name the specific student error (what/where/why) and reference the offending step; vague topic-level comments are insufficient. The correct answer is Yes."
@@ -580,21 +538,16 @@ def short_feedback(track: str, gold: str, pred: Optional[str], had_answer_tag: b
             return "You noticed the area but missed precision; state the exact incorrect step or concept and why it’s wrong. The correct answer is To some extent."
         if gold == "No" and pred != "No":
             return "You asserted an error that isn’t present; avoid inventing mistakes and only label Yes when a concrete error is identified. The correct answer is No."
-        elif gold != pred:
+        if gold != pred:
             return "The correct answer is " + gold + "."
-        #if pred == "Yes" and not _has_pinpoint(assistant_text):
-        #    return "“Yes” requires precision: point to the exact student step and the violated rule before labeling."
         return "Correct under the MI rubric."
     else:
-        # TRACK_PG
         if gold == "Yes" and pred != "Yes":
             return "Provide one concrete, accurate next step aligned with the student’s issue (e.g., compute/apply/substitute/rewrite)."
         if gold == "To some extent" and pred == "No":
             return "Some guidance exists but is vague; add a specific action or example to make it usable."
         if gold == "No" and pred != "No":
             return "The advice is incorrect or off-target; remove misleading steps and only guide when aligned to the student’s need."
-        #if pred == "Yes" and not _has_action_step(assistant_text):
-        #    return "“Yes” requires at least one actionable step; add a concrete instruction rather than generic encouragement."
         if gold != pred:
             return "The correct answer is " + gold + "."
         return "Correct under the PG rubric."
@@ -634,12 +587,9 @@ def build_reflection_casebook(
         selected.extend(pool[:need])
     return selected[: (k_fail + k_pass)]
 
-
-
 # ==========================================
 # Section 6 — reflector (OpenAI Chat wrapper)
 # ==========================================
-
 
 ALLOWED_LABELS_TEXT = "Yes|No|To some extent"
 
@@ -671,7 +621,6 @@ def _render_reflection_prompt(current_instruction: str, casebook: List[Dict[str,
         "Return ONLY the new instruction inside triple backticks.\n"
     )
 
-
 def _parse_backticked_instructions(text: str) -> Optional[str]:
     if "```" not in text:
         return None
@@ -691,16 +640,10 @@ def count_contract_violations(trajs: List[Dict[str, Any]]) -> Dict[str, int]:
     offvocab = sum(1 if t.get("off_vocab_label") else 0 for t in trajs)
     return {"missing_tag": missing, "off_vocab": offvocab}
 
-from groq import Groq
-from google import genai
+# Note: you’ve wired OpenAI below; feel free to swap to Groq/genai again later.
 from openai import OpenAI
 class OpenAIReflector:
     def __init__(self, model_name: str = "deepseek-r1-distill-llama-70b", timeout_seconds: float = 60.0, max_retries: int = 4):
-        #if OpenAI is None:
-         #   raise RuntimeError("openai package not available. `pip install openai>=1.30`")
-        
-        #self.client = Groq()
-        #self.client = genai.Client()
         self.client = OpenAI()
         self.model_name = model_name
         self.max_retries = max_retries
@@ -710,37 +653,22 @@ class OpenAIReflector:
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
-                # Save prompt to tmp.txt for debugging
                 with open("tmp.txt", "w", encoding="utf-8") as f:
                     f.write(prompt_text)
                 resp = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[{"role": "user", "content": prompt_text}],
-                    #temperature=0.8,
-                    #top_p=0.95,
-                    #max_tokens=8192
                 )
-                '''
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt_text,
-                )'''
-
                 text = resp.choices[0].message.content
-                #text = response.text
-                print("Text: ", text)
-                new_inst = _parse_backticked_instructions(text)
-                print("New instruction: ", new_inst)
+                new_inst = _parse_backticked_instructions(text or "")
                 if new_inst and _passes_contract(new_inst):
                     return new_inst
                 last_err = RuntimeError("Reflector returned invalid or missing backticked instruction.")
             except Exception as e:
                 last_err = e
-                print("Error: ", e)
+                print("Reflector error:", e)
             time.sleep(1.2 * (2 ** attempt))
         return None
-
-
 
 # ======================================
 # Section 7 — eval helpers (dev accuracy)
@@ -765,10 +693,22 @@ def evaluate_split_accuracy(
             task_model=task_model,
             generation_temperature=0.4,
             generation_top_p=0.95,
-            generation_max_new_tokens=2048
+            generation_max_new_tokens=1024
         )
         correct += sum(scores)
     return correct / total
+
+# Useful small I/O helpers
+def _prompt_sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+def _write_text(path: str, text: str) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
+def _write_json(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
 
 # ======================================
 # Section 7.1 — full-set evaluation utils
@@ -779,11 +719,6 @@ def run_full_eval(
     task_model: SimpleHFChat,
     batch_size: int = 16,
 ) -> Tuple[float, List[Dict[str, Any]]]:
-    """
-    Returns:
-      acc: accuracy on the split
-      details: per-example dicts {gold, parsed, ok, output}
-    """
     total = len(examples)
     if total == 0:
         return 0.0, []
@@ -799,7 +734,7 @@ def run_full_eval(
             task_model=task_model,
             generation_temperature=0.4,
             generation_top_p=0.95,
-            generation_max_new_tokens=2048
+            generation_max_new_tokens=1024
         )
         correct += sum(scores)
         for t in traj:
@@ -811,7 +746,6 @@ def run_full_eval(
             })
     return correct / total, details
 
-
 def evaluate_prompt_on_splits(
     system_prompt: str,
     splits: Dict[str, List[TrainExample]],
@@ -820,17 +754,11 @@ def evaluate_prompt_on_splits(
     batch_size: int = 16,
     dump_preds: Optional[str] = None,
 ) -> Dict[str, float]:
-    """
-    Evaluate `system_prompt` on chosen splits (e.g., ["dev","test"]).
-    If dump_preds is provided, saves a JSONL with one record per example:
-      {"split": "...", "gold": "...", "parsed": "...", "ok": 0|1, "output": "..."}
-    """
     metrics: Dict[str, float] = {}
     f_out = None
     try:
         if dump_preds:
             f_out = open(dump_preds, "w", encoding="utf-8")
-
         for name in eval_splits:
             if name not in splits:
                 print(f"[WARN] Unknown split '{name}' (available: {list(splits.keys())})")
@@ -838,7 +766,6 @@ def evaluate_prompt_on_splits(
             acc, details = run_full_eval(system_prompt, splits[name], task_model, batch_size=batch_size)
             metrics[name] = acc
             print(f"[EVAL] {name.upper()} n={len(splits[name])} acc={acc:.3f}")
-
             if f_out:
                 for d in details:
                     rec = {"split": name, **d}
@@ -849,14 +776,9 @@ def evaluate_prompt_on_splits(
             print(f"[EVAL] wrote predictions to {dump_preds}")
     return metrics
 
-
-
 # ======================================
 # Section 8 — acceptance loop (the heart)
 # ======================================
-
-def _prompt_sha1(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
 
 def optimize_instruction_with_reflection(
     seed_system_prompt: str,
@@ -879,25 +801,29 @@ def optimize_instruction_with_reflection(
     best_dev_acc = 0.0
     iters_since_accept = 0
 
-    for iteration in tqdm.tqdm(range(1, num_iterations + 1)):
+    with open("accepted_prompt.txt", "a", encoding="utf-8") as f:
+        f.write("Base Prompt:")
+        f.write(current_prompt)
+        f.write("\n\n\n")
+        f.write("--------------------------------\n\n\n")
+
+    for iteration in tqdm.tqdm(range(1, num_iterations + 1), desc="Optimize"):
         batch_indices = sampler.sample_indices(minibatch_size)
         minibatch = [train_examples[i] for i in batch_indices]
 
-        # evaluate current prompt
         _, old_scores, old_traj = evaluate_minibatch_once(
             current_system_prompt=current_prompt,
             minibatch_examples=minibatch,
             task_model=task_model,
             generation_temperature=0.4,
             generation_top_p=0.95,
-            generation_max_new_tokens=2048
+            generation_max_new_tokens=1024
         )
-        print("Old scores: ", old_scores)
         old_sum = sum(old_scores)
         old_v = count_contract_violations(old_traj)
 
         if old_sum == len(minibatch):
-            print(f"[iter {iteration:03d}] batch perfect ({old_sum}/{len(minibatch)}). skip reflection.")
+            print(f"[iter {iteration:03d}] perfect ({old_sum}/{len(minibatch)}); skip reflection.")
             iters_since_accept += 1
         else:
             casebook = build_reflection_casebook(old_traj, track=track, k_fail=6, k_pass=2)
@@ -906,22 +832,17 @@ def optimize_instruction_with_reflection(
                 print(f"[iter {iteration:03d}] reflection failed; keep current.")
                 iters_since_accept += 1
             else:
-                # strict A/B on same batch
                 _, new_scores, new_traj = evaluate_minibatch_once(
                     current_system_prompt=proposed_prompt,
                     minibatch_examples=minibatch,
                     task_model=task_model,
                     generation_temperature=0.4,
                     generation_top_p=0.95,
-                    generation_max_new_tokens=2048
+                    generation_max_new_tokens=1024
                 )
                 new_sum = sum(new_scores)
                 new_v = count_contract_violations(new_traj)
 
-                # Acceptance rule:
-                # 1) must improve accuracy; and
-                # 2) must not increase contract violations; and
-                # 3) off-vocab must be zero (hard guard).
                 improved = new_sum > old_sum
                 contract_ok = (new_v["missing_tag"] <= old_v["missing_tag"]) and (new_v["off_vocab"] <= old_v["off_vocab"])
                 hard_guard = (new_v["off_vocab"] == 0)
@@ -929,19 +850,24 @@ def optimize_instruction_with_reflection(
                 accepted = bool(improved and contract_ok and hard_guard)
                 status = "ACCEPT" if accepted else "reject"
                 if accepted:
-                    with open("accepted_prompt.txt", "w", encoding="utf-8") as f:
+                    with open("accepted_prompt.txt", "a", encoding="utf-8") as f:
                         f.write(proposed_prompt)
-                    
-                more = f"old={old_sum:.0f}/{len(minibatch)} v={old_v} new={new_sum:.0f}/{len(minibatch)} v={new_v}"
-                print(f"[iter {iteration:03d}] {status} {more} prompt={_prompt_sha1(proposed_prompt)}")
+                        f.write("\n\n\n")
+                        f.write("--------------------------------\n\n\n")
+                
+                print(f"[iter {iteration:03d}] {status} old={old_sum:.0f}/{len(minibatch)} v={old_v} new={new_sum:.0f}/{len(minibatch)} v={new_v} prompt={_prompt_sha1(proposed_prompt)}")
 
                 if accepted:
                     current_prompt = proposed_prompt
                     iters_since_accept = 0
+                    #_write_text("accepted_prompt.txt", proposed_prompt)
                 else:
-                    # secondary tie-break: if accuracy ties but strictly fewer violations, you may allow:
-                    if (new_sum == old_sum) and ( (new_v["missing_tag"] < old_v["missing_tag"]) or (new_v["off_vocab"] < old_v["off_vocab"]) ) and hard_guard:
+                    if (new_sum == old_sum) and ((new_v["missing_tag"] < old_v["missing_tag"]) or (new_v["off_vocab"] < old_v["off_vocab"])) and hard_guard:
                         print(f"[iter {iteration:03d}] ACCEPT (tie on acc, fewer violations).")
+                        with open("accepted_prompt.txt", "a", encoding="utf-8") as f:
+                            f.write(proposed_prompt)
+                            f.write("\n\n\n\n\n\n\n\n\n\n\n")
+                            f.write("--------------------------------")
                         current_prompt = proposed_prompt
                         iters_since_accept = 0
                     else:
@@ -952,20 +878,75 @@ def optimize_instruction_with_reflection(
             if dev_acc >= best_dev_acc:
                 best_dev_acc = dev_acc
                 best_prompt = current_prompt
+                with open("best_prompts.txt", "a", encoding="utf-8") as f:
+                    f.write(best_prompt)
+                    f.write("\n\n\n\n\n\n\n\n\n\n\n")
+                    f.write("--------------------------------\n\n\n")
             print(f"[iter {iteration:03d}] DEV acc={dev_acc:.3f} best={best_dev_acc:.3f} prompt={_prompt_sha1(current_prompt)}")
 
         if iters_since_accept >= patience:
-            print(f"[iter {iteration:03d}] stop early; no acceptance for {patience} iters.")
+            print(f"[iter {iteration:03d}] early stop: no acceptance for {patience} iters.")
             break
 
     return best_prompt, best_dev_acc
 
+def run_epochs(
+    seed_prompt: str,
+    train_examples: List[TrainExample],
+    dev_examples: List[TrainExample],
+    task_model: Any,
+    reflector: Any,
+    epochs: int,
+    iters_per_epoch: int,
+    minibatch_size: int,
+    dev_every: int,
+    patience: int,
+    global_seed: int,
+    track: str
+) -> Tuple[str, float, List[Dict[str, Any]]]:
+    """
+    Runs 'epochs' independent hill-climbs, each starting from the same seed.
+    Saves the best prompt of every epoch to: epoch_{ep:02d}_best.txt
+    Returns (final_best_prompt, final_best_dev_acc, per_epoch_summary).
+    """
+    epoch_summ: List[Dict[str, Any]] = []
+    best_overall_prompt = seed_prompt
+    best_overall_acc = -1.0
+
+    for ep in range(1, epochs + 1):
+        print(f"\n=== EPOCH {ep}/{epochs}: restarting from seed ===")
+        ep_best_prompt, ep_best_dev_acc = optimize_instruction_with_reflection(
+            seed_system_prompt=seed_prompt,
+            train_examples=train_examples,
+            dev_examples=dev_examples,
+            task_model=task_model,
+            reflector=reflector,
+            num_iterations=iters_per_epoch,
+            minibatch_size=minibatch_size,
+            dev_every=dev_every,
+            patience=patience,
+            global_seed=global_seed + ep,  # nudge seed a bit per epoch
+            track=track,
+        )
+
+        # save epoch-best prompt
+        ep_path = f"epoch_{ep:02d}_best.txt"
+        with open(ep_path, "w", encoding="utf-8") as f:
+            f.write(ep_best_prompt)
+        print(f"[EPOCH {ep}] saved {ep_path} (dev_acc={ep_best_dev_acc:.3f})")
+
+        epoch_summ.append({"epoch": ep, "dev_acc": float(ep_best_dev_acc), "path": ep_path})
+
+        if ep_best_dev_acc > best_overall_acc:
+            best_overall_acc = ep_best_dev_acc
+            best_overall_prompt = ep_best_prompt
+
+    return best_overall_prompt, best_overall_acc, epoch_summ
 
 
 # =========================
 # Section 9 — main script
 # =========================
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -975,13 +956,20 @@ def main():
     parser.add_argument("--target_label", type=str, default="Mistake_Identification",
                         choices=["Providing_Guidance", "Mistake_Identification"])
     parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--openai_reflector_model", type=str, default="deepseek-r1-distill-llama-70b")
+    #parser.add_argument("--hf_task_model", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--openai_reflector_model", type=str, default="gpt-5-nano-2025-08-07") #deepseek-r1-distill-llama-70b #gpt-5-2025-08-07 #gpt-5-nano-2025-08-07
 
-    # optimize-mode knobs
-    parser.add_argument("--iterations", type=int, default=60)
+    # optimize-mode knobs (epochal)
+    parser.add_argument("--epochs", type=int, default=10, help="Number of restarts (finalists).")
+    parser.add_argument("--iters_per_epoch", type=int, default=10, help="Iterations per epoch.")
+    parser.add_argument("--final_val_frac", type=float, default=0.5, help="Fraction of dev reserved for final-val selection.")
+    parser.add_argument("--no_restart", action="store_true", help="If set, carry best prompt from previous epoch instead of restarting from seed.")
     parser.add_argument("--minibatch_size", type=int, default=4)
     parser.add_argument("--dev_every", type=int, default=5)
     parser.add_argument("--patience", type=int, default=20)
+
+    # legacy single-run (still supported)
+    parser.add_argument("--iterations", type=int, default=60, help="Used only if epochs==1.")
 
     # evaluate-mode knobs
     parser.add_argument("--prompt_text", type=str, default=None, help="Inline prompt text to evaluate.")
@@ -1002,18 +990,42 @@ def main():
     train, dev, test = stratified_split(examples, 0.8, 0.1, 0.1, rng_seed=args.seed)
     print(f"Split sizes: train={len(train)} dev={len(dev)} test={len(test)}")
 
-    
-    seed_prompt = build_seed_prompt(track)
+    # dev -> dev_loop + final_val
+    dev_loop, final_val = stratified_subsplit(dev, final_val_frac=args.final_val_frac, rng_seed=args.seed + 999)
+    print(f"Dev split: dev_loop={len(dev_loop)} final_val={len(final_val)}")
 
+    #seed_prompt = build_seed_prompt(track)
+    seed_prompt = """<instruction>
+You are evaluating whether the candidate tutor response explicitly identifies a student mistake according to a strict three-part criterion. Output exactly one label inside an <answer> tag, chosen from: Yes|No|To some extent, and formatted exactly as: <answer> Yes|No|To some extent </answer>.
+
+Decision rules (apply to the tutor reply and the student’s exact statement):
+
+- Yes: The tutor response explicitly targets a single offending clause from the student’s statement and includes all three elements tied to that same clause:
+  1) a direct quote or precise paraphrase of that exact offending clause (one clause only),
+  2) the specific concept or rule violated by that clause,
+  3) a concise explanation of why that clause is incorrect, explicitly linked to that clause.
+
+  All three elements must be present and clearly reference the same exact student clause.
+
+- To some extent: The tutor response indicates an error but misses one or more of the three elements (quote/paraphrase of the exact offending clause, naming the violated rule, or a clear justification), or the connection among the clause, the rule, and the why is vague. If there are multiple possible errors, choose the most clearly identifiable single offending clause and anchor the three-part requirement to that clause; otherwise, the label should reflect partial accuracy.
+
+- No: The tutor response fails to identify any concrete error, misidentifies an error, or is only praise/unrelated to pinpointing a mistake.
+
+Additional guidance:
+
+- Base your decision solely on the candidate tutor reply and the student’s exact statement being criticized.
+- If the student’s answer is correct, a tutor response that asserts an error should be labeled No.
+- Do not invent errors not present in the student’s statement; do not quote more than one exact clause.
+- If the student presents multiple potential errors, select the single most clearly identifiable offending clause to anchor your label.
+</instruction>"""
 
     # task model (HF)
     print(f"Loading HF task model: {args.hf_task_model}")
-    #task_model = SimpleHFChat(args.hf_task_model)
     task_model = QwenHFChat(args.hf_task_model)
     print("Model loaded")
+
     if args.mode == "evaluate":
         # decide prompt
-        prompt = None
         if args.prompt_text:
             prompt = args.prompt_text
         elif args.prompt_path and os.path.exists(args.prompt_path):
@@ -1021,12 +1033,8 @@ def main():
         else:
             prompt = seed_prompt
             print("[EVAL] No --prompt_text/--prompt_path provided; using track-specific seed prompt.")
-
-        # which splits to eval
         wanted = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
-        splits = {"train": train, "dev": dev, "test": test}
-
-        # run evaluation
+        splits = {"train": train, "dev": dev, "test": test, "dev_loop": dev_loop, "final_val": final_val}
         evaluate_prompt_on_splits(
             system_prompt=prompt,
             splits=splits,
@@ -1038,39 +1046,109 @@ def main():
         return
 
     # === optimize mode (default) ===
-    # reflector (OpenAI)
     if not os.environ.get("OPENAI_API_KEY"):
-        print("WARNING: OPENAI_API_KEY not set; reflection will fail. Set env var to enable reflector.", file=sys.stderr)
+        print("WARNING: OPENAI_API_KEY not set; reflection will likely fail.", file=sys.stderr)
     reflector = OpenAIReflector(model_name=args.openai_reflector_model)
 
-    # optimize
-    best_prompt, best_dev_acc = optimize_instruction_with_reflection(
-        seed_system_prompt=seed_prompt,
-        train_examples=train,
-        dev_examples=dev,
-        task_model=task_model,
-        reflector=reflector,
-        num_iterations=args.iterations,
-        minibatch_size=args.minibatch_size,
-        dev_every=args.dev_every,
-        patience=args.patience,
-        global_seed=args.seed,
-        track=track
-    )
+    # Epochal restarts -> finalists
+    finalists: List[Dict[str, Any]] = []
+  
+    if args.iters_per_epoch is not None:
+        epochs = max(1, args.epochs)
+        iters_per_epoch = args.iters_per_epoch
+    else:
+        # fallback to single-epoch behavior
+        epochs = 1
+        iters_per_epoch = args.iterations
 
-    # final eval on test with best prompt
-    test_acc = evaluate_split_accuracy(best_prompt, test, task_model, minibatch_size=12)
+    epochs = max(1, int(args.epochs))
+    iters_per_epoch = args.iters_per_epoch if epochs > 1 else args.iterations
 
-    # print & save
-    print("\n=== BEST PROMPT ===\n")
-    print(best_prompt)
-    print(f"\nBEST DEV ACC: {best_dev_acc:.3f} | TEST ACC: {test_acc:.3f}")
+    if epochs > 1:
+        best_prompt, best_dev_acc, epoch_summ = run_epochs(
+            seed_prompt=seed_prompt,
+            train_examples=train,
+            dev_examples=dev_loop,   # <- use dev_loop for the inner search
+            task_model=task_model,
+            reflector=reflector,
+            epochs=epochs,
+            iters_per_epoch=iters_per_epoch,
+            minibatch_size=args.minibatch_size,
+            dev_every=args.dev_every,
+            patience=args.patience,
+            global_seed=args.seed,
+            track=track
+        )
+    else:
+        best_prompt, best_dev_acc = optimize_instruction_with_reflection(
+            seed_system_prompt=seed_prompt,
+            train_examples=train,
+            dev_examples=dev_loop,   # <- same: use dev_loop here
+            task_model=task_model,
+            reflector=reflector,
+            num_iterations=iters_per_epoch,
+            minibatch_size=args.minibatch_size,
+            dev_every=args.dev_every,
+            patience=args.patience,
+            global_seed=args.seed,
+            track=track
+        )
 
-    with open("best_prompt.txt", "w", encoding="utf-8") as f:
-        f.write(best_prompt)
-    with open("final_metrics.json", "w", encoding="utf-8") as f:
-        json.dump({"best_dev_acc": best_dev_acc, "test_acc": test_acc}, f, indent=2)
-    print("\nSaved best_prompt.txt and final_metrics.json")
+    finalists = []
+    if epochs > 1:
+        # Reconstruct finalists from epoch_summ
+        for rec in epoch_summ:
+            ep = rec["epoch"]
+            dev_acc = rec["dev_acc"]
+            path = rec["path"]                  # e.g., "epoch_01_best.txt"
+            with open(path, "r", encoding="utf-8") as f:
+                prompt = f.read()
+            finalists.append({
+                "epoch": ep,
+                "prompt": prompt,
+                "dev_loop_acc": float(dev_acc),
+                "prompt_sha": _prompt_sha1(prompt),
+            })
+    else:
+        # Single-epoch run → single finalist
+        finalists.append({
+            "epoch": 1,
+            "prompt": best_prompt,
+            "dev_loop_acc": float(best_dev_acc),
+            "prompt_sha": _prompt_sha1(best_prompt),
+        })
+
+    # ===== Finalist selection on held-out final_val =====
+    print("\n========== FINALIST SELECTION (final_val) ==========")
+    best_idx = -1
+    best_final_val_acc = -1.0
+    for i, fin in enumerate(finalists):
+        acc = evaluate_split_accuracy(fin["prompt"], final_val, task_model, minibatch_size=args.minibatch_size)
+        finalists[i]["final_val_acc"] = float(acc)
+        print(f"[finalist {i+1}/{len(finalists)}] epoch={fin['epoch']} sha={fin['prompt_sha']} dev_loop={fin['dev_loop_acc']:.3f} final_val={acc:.3f}")
+        if acc > best_final_val_acc or (abs(acc - best_final_val_acc) < 1e-9 and fin["dev_loop_acc"] > finalists[best_idx].get("dev_loop_acc", -1) if best_idx >= 0 else True):
+            best_final_val_acc = acc
+            best_idx = i
+
+    champion = finalists[best_idx]
+    champion_prompt = champion["prompt"]
+    _write_json("finalists.json", {"finalists": finalists, "chosen_idx": best_idx})
+    test_acc = evaluate_split_accuracy(champion_prompt, test, task_model, minibatch_size=12)
+    print("\n=== CHAMPION PROMPT ===\n")
+    print(champion_prompt)
+    print(f"\nCHAMPION: epoch={champion['epoch']} sha={champion['prompt_sha']} dev_loop_acc={champion['dev_loop_acc']:.3f} final_val_acc={champion['final_val_acc']:.3f} | TEST ACC: {test_acc:.3f}")
+    _write_text("best_prompt.txt", champion_prompt)
+    _write_json("final_metrics.json", {
+        "champion": {
+            "epoch": champion["epoch"],
+            "prompt_sha": champion["prompt_sha"],
+            "dev_loop_acc": champion["dev_loop_acc"],
+            "final_val_acc": champion["final_val_acc"],
+        },
+        "test_acc": test_acc
+    })
+
+    print("\nSaved best_prompt.txt, finalists.json and final_metrics.json")
 
 if __name__ == "__main__":
     main()
